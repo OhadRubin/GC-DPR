@@ -20,7 +20,7 @@ import logging
 import pickle
 import time
 from typing import List, Tuple, Dict, Iterator
-
+import tqdm.auto as tqdm
 import numpy as np
 import torch
 from torch import Tensor as T
@@ -30,7 +30,7 @@ from dpr.data.qa_validation import calculate_matches
 from dpr.models import init_biencoder_components
 from dpr.options import add_encoder_params, setup_args_gpu, print_args, set_encoder_params_from_state, \
     add_tokenizer_params, add_cuda_params
-from dpr.utils.data_utils import Tensorizer
+from dpr.utils.data_utils import Tensorizer,read_data_from_json_files
 from dpr.utils.model_utils import setup_for_distributed_mode, get_model_obj, load_states_from_checkpoint
 from dpr.indexer.faiss_indexers import DenseIndexer, DenseHNSWFlatIndexer, DenseFlatIndexer
 
@@ -67,8 +67,8 @@ class DenseRetriever(object):
 
                 q_ids_batch = torch.stack(batch_token_tensors, dim=0).cuda()
                 q_seg_batch = torch.zeros_like(q_ids_batch).cuda()
-                q_attn_mask = self.tensorizer.get_attn_mask(q_ids_batch)
-                _, out, _ = self.question_encoder(q_ids_batch, q_seg_batch, q_attn_mask)
+                q_attn_mask = self.tensorizer.get_attn_mask(q_ids_batch).int()
+                out = self.question_encoder(q_ids_batch, q_seg_batch, q_attn_mask)[1]
 
                 query_vectors.extend(out.cpu().split(1, dim=0))
 
@@ -95,13 +95,23 @@ class DenseRetriever(object):
         return results
 
 
-def parse_qa_csv_file(location) -> Iterator[Tuple[str, List[str]]]:
-    with open(location) as ifile:
-        reader = csv.reader(ifile, delimiter='\t')
-        for row in reader:
-            question = row[0]
-            answers = eval(row[1])
-            yield question, answers
+# def parse_qa_csv_file(location) -> Iterator[Tuple[str, List[str]]]:
+
+#     data = 
+#     for datum in data:
+
+        
+        # proof_el = datum['positive_ctxs'][0]
+        # row = [datum['aid'],proof_el['text'],proof_el['title']]
+        # rows.append()
+        # docs[row[0]] = (row[1], row[2])
+    # with open(location) as ifile:
+    #     reader = csv.reader(ifile, delimiter='\t')
+    
+    #     for row in reader:
+    #         question = row[0]
+    #         answers = eval(row[1])
+    #         yield question, answers
 
 
 def validate(passages: Dict[object, Tuple[str, str]], answers: List[List[str]],
@@ -127,43 +137,57 @@ def load_passages(ctx_file: str) -> Dict[object, Tuple[str, str]]:
                 if row[0] != 'id':
                     docs[row[0]] = (row[1], row[2])
     else:
-        with open(ctx_file) as tsvfile:
-            reader = csv.reader(tsvfile, delimiter='\t', )
+        # with open(ctx_file) as tsvfile:
+        #     reader = csv.reader(tsvfile, delimiter='\t', )
             # file format: doc_id, doc_text, title
-            for row in reader:
-                if row[0] != 'id':
-                    docs[row[0]] = (row[1], row[2])
+        # ctx_file = 
+        file_list = glob.glob(ctx_file)
+
+        for file_path in tqdm.tqdm(file_list):
+            with open(file_path) as f:
+                for line in f:
+                    datum = json.loads(line)
+                    # for i,proof_el in enumerate(datum['positive_ctxs']): 
+                    docs[datum['id']] = [datum['contents'],datum['meta']['title']]
+                    # rows.append()
+        # data = read_data_from_json_files([ctx_file])
+        # for datum in data:
+        #     for i,proof_el in enumerate(datum['positive_ctxs']): 
+        #         # proof_el = datum['positive_ctxs'][0]
+        #         # rows.append()
+        #         row = [f"{datum['aid']}__{i}",proof_el['text'],proof_el['title']]
+        #         # rows.append()
+        #         docs[row[0]] = (row[1], row[2])
+            # for row in reader:
+            #     if row[0] != 'id':
+            #         
     return docs
 
 
-def save_results(passages: Dict[object, Tuple[str, str]], questions: List[str], answers: List[List[str]],
+def save_results(passages: Dict[object, Tuple[str, str]],
+                 qa_data,
                  top_passages_and_scores: List[Tuple[List[object], List[float]]], per_question_hits: List[List[bool]],
                  out_file: str
                  ):
     # join passages text with the result ids, their questions and assigning has|no answer labels
     merged_data = []
-    assert len(per_question_hits) == len(questions) == len(answers)
-    for i, q in enumerate(questions):
-        q_answers = answers[i]
+    assert len(per_question_hits) == len(qa_data)
+    for i, ds_item in enumerate(qa_data):
         results_and_scores = top_passages_and_scores[i]
         hits = per_question_hits[i]
         docs = [passages[doc_id] for doc_id in results_and_scores[0]]
         scores = [str(score) for score in results_and_scores[1]]
         ctxs_num = len(hits)
-
-        merged_data.append({
-            'question': q,
-            'answers': q_answers,
-            'ctxs': [
-                {
-                    'id': results_and_scores[0][c],
+        ctxs = []
+        for c in range(ctxs_num):
+            ctxs.append({'id': results_and_scores[0][c],
                     'title': docs[c][1],
                     'text': docs[c][0],
                     'score': scores[c],
-                    'has_answer': hits[c],
-                } for c in range(ctxs_num)
-            ]
-        })
+                    'has_answer': hits[c], })
+         
+        ds_item['ctxs'] = ctxs
+        merged_data.append(ds_item)
 
     with open(out_file, "w") as writer:
         writer.write(json.dumps(merged_data, indent=4) + "\n")
@@ -181,6 +205,10 @@ def iterate_encoded_files(vector_files: list) -> Iterator[Tuple[object, np.array
 
 
 def main(args):
+    all_passages = load_passages(args.ctx_file)
+
+    if len(all_passages) == 0:
+        raise RuntimeError('No passages data found. Please specify ctx_file param properly.')
     saved_state = load_states_from_checkpoint(args.model_file)
     set_encoder_params_from_state(saved_state.encoder_params, args)
 
@@ -201,24 +229,27 @@ def main(args):
     question_encoder_state = {key[prefix_len:]: value for (key, value) in saved_state.model_dict.items() if
                               key.startswith('question_model.')}
     model_to_load.load_state_dict(question_encoder_state)
-    vector_size = model_to_load.get_out_size()
+    vector_size = model_to_load.config.hidden_size
     logger.info('Encoder vector_size=%d', vector_size)
 
     if args.hnsw_index:
         index = DenseHNSWFlatIndexer(vector_size, args.index_buffer)
     else:
         index = DenseFlatIndexer(vector_size, args.index_buffer)
+        
 
     retriever = DenseRetriever(encoder, args.batch_size, tensorizer, index)
 
     # get questions & answers
     questions = []
     question_answers = []
-
-    for ds_item in parse_qa_csv_file(args.qa_file):
-        question, answers = ds_item
-        questions.append(question)
-        question_answers.append(answers)
+    qa_file = glob.glob(args.qa_file.replace('"', ''))
+    qa_data = read_data_from_json_files(qa_file)
+    for ds_item in qa_data:
+        # yield , 
+        # question, answers = ds_item
+        questions.append(ds_item['question'])
+        question_answers.append(ds_item['answers'])
 
     if args.q_encoding_path and not args.re_encode_q and os.path.exists(args.q_encoding_path):
         questions_tensor = torch.load(args.q_encoding_path)
@@ -247,16 +278,13 @@ def main(args):
     # get top k results
     top_ids_and_scores = retriever.get_top_docs(questions_tensor.numpy(), args.n_docs)
 
-    all_passages = load_passages(args.ctx_file)
-
-    if len(all_passages) == 0:
-        raise RuntimeError('No passages data found. Please specify ctx_file param properly.')
+    
 
     questions_doc_hits = validate(all_passages, question_answers, top_ids_and_scores, args.validation_workers,
                                   args.match)
 
     if args.out_file:
-        save_results(all_passages, questions, question_answers, top_ids_and_scores, questions_doc_hits, args.out_file)
+        save_results(all_passages, qa_data, top_ids_and_scores, questions_doc_hits, args.out_file)
 
 
 if __name__ == '__main__':

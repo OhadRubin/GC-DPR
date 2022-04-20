@@ -15,7 +15,7 @@ import logging
 import random
 from dataclasses import dataclass
 from typing import Tuple, List
-
+import json
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -75,8 +75,7 @@ class BiEncoder(nn.Module):
         self.fix_ctx_encoder = fix_ctx_encoder
 
     @staticmethod
-    def get_representation(sub_model: nn.Module, ids: T, segments: T, attn_mask: T, fix_encoder: bool = False) -> (
-            T, T, T):
+    def get_representation(sub_model: nn.Module, ids: T, segments: T, attn_mask: T, fix_encoder: bool = False):
         sequence_output = None
         pooled_output = None
         hidden_states = None
@@ -89,9 +88,16 @@ class BiEncoder(nn.Module):
                     sequence_output.requires_grad_(requires_grad=True)
                     pooled_output.requires_grad_(requires_grad=True)
             else:
-                sequence_output, pooled_output, hidden_states = sub_model(ids, segments, attn_mask)
+                output = sub_model(ids, segments, attn_mask.long())
+                # print(a)
+                # print(len(a))
+                # hidden_states = output.last_hidden_state
+                pooled_output = output.pooler_output
+                # sequence_output = output.sequence_output
 
-        return sequence_output, pooled_output, hidden_states
+                # sequence_output, pooled_output, hidden_states = a
+
+        return None, pooled_output, None
 
     def forward(self, question_ids: T, question_segments: T, question_attn_mask: T, context_ids: T, ctx_segments: T,
                 ctx_attn_mask: T) -> Tuple[T, T]:
@@ -112,6 +118,7 @@ class BiEncoder(nn.Module):
             num_other_negatives: int = 0,
             shuffle: bool = True,
             shuffle_positives: bool = False,
+            unique_idx: bool = False,
     ):
         def fn(samples: List):
             return cls.create_biencoder_input(
@@ -120,6 +127,7 @@ class BiEncoder(nn.Module):
                 num_other_negatives=num_other_negatives,
                 shuffle=shuffle,
                 shuffle_positives=shuffle_positives,
+                unique_idx=unique_idx,
             )
         return fn
 
@@ -134,6 +142,7 @@ class BiEncoder(nn.Module):
                                num_other_negatives: int = 0,
                                shuffle: bool = True,
                                shuffle_positives: bool = False,
+                               unique_idx: bool = False,
                                ) -> BiEncoderBatch:
         """
         Creates a batch of the biencoder training tuple.
@@ -154,14 +163,25 @@ class BiEncoder(nn.Module):
         for sample in samples:
             # ctx+ & [ctx-] composition
             # as of now, take the first(gold) ctx+ only
-            if shuffle and shuffle_positives:
-                positive_ctxs = sample['positive_ctxs']
-                positive_ctx = positive_ctxs[np.random.choice(len(positive_ctxs))]
+            if unique_idx:
+                positive_ctxs = list({x['chunk_id']:x for x in sample['positive_ctxs']}.values())
             else:
-                positive_ctx = sample['positive_ctxs'][0]
+                positive_ctxs = sample['positive_ctxs']
 
-            neg_ctxs = sample['negative_ctxs']
-            hard_neg_ctxs = sample['hard_negative_ctxs']
+            # print(len(positive_ctxs))
+            # print(len(positive_ctxs[0]))
+            positive_ctx = positive_ctxs[np.random.choice(len(positive_ctxs))]
+
+            # print()
+            # if shuffle and shuffle_positives:
+                
+            # else:
+            #     positive_ctx = sample['positive_ctxs'][0]
+
+            neg_ctxs = sample['negative_ctxs'] if 'negative_ctxs' in sample else []
+            hard_neg_ctxs = sample['hard_negative_ctxs'] if 'hard_negative_ctxs' in sample else []
+            if unique_idx:
+                hard_neg_ctxs = list({x['chunk_id']:x for x in hard_neg_ctxs}.values())
             question = normalize_question(sample['question'])
 
             if shuffle:
@@ -176,10 +196,10 @@ class BiEncoder(nn.Module):
             hard_negatives_end_idx = 1 + len(hard_neg_ctxs)
 
             current_ctxs_len = len(ctx_tensors)
-
+            
             sample_ctxs_tensors = [tensorizer.text_to_tensor(ctx['text'], title=ctx['title'] if insert_title else None)
-                                   for
-                                   ctx in all_ctxs]
+                                for ctx in all_ctxs]
+                                
 
             ctx_tensors.extend(sample_ctxs_tensors)
             positive_ctx_indices.append(current_ctxs_len)

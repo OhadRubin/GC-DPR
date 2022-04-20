@@ -12,7 +12,8 @@
 """
 import os
 import pathlib
-
+# import debugpy
+# debugpy.listen(5679)
 import argparse
 import csv
 import logging
@@ -29,8 +30,10 @@ from torch.utils.data import DataLoader, Dataset
 from dpr.models import init_biencoder_components
 from dpr.options import add_encoder_params, setup_args_gpu, print_args, set_encoder_params_from_state, \
     add_tokenizer_params, add_cuda_params
-from dpr.utils.data_utils import Tensorizer
+from dpr.utils.data_utils import Tensorizer,reformat_data_answer, read_data_from_json_files
 from dpr.utils.model_utils import setup_for_distributed_mode, get_model_obj, load_states_from_checkpoint,move_to_device
+import more_itertools
+import glob
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -72,13 +75,19 @@ def gen_ctx_vectors(ctx_rows: List[Tuple[object, str, str]], model: nn.Module, t
     for batch_id, batch_token_tensors in enumerate(tqdm(loader)):
         ctx_ids_batch = move_to_device(torch.stack(batch_token_tensors, dim=0),args.device)
         ctx_seg_batch = move_to_device(torch.zeros_like(ctx_ids_batch),args.device)
-        ctx_attn_mask = move_to_device(tensorizer.get_attn_mask(ctx_ids_batch),args.device)
+        ctx_attn_mask = move_to_device(tensorizer.get_attn_mask(ctx_ids_batch),args.device).int()
+        # print(ctx_ids_batch.shape,ctx_seg_batch.shape,ctx_attn_mask.shape)
+        # print(ctx_ids_batch.dtype,ctx_seg_batch.dtype,ctx_attn_mask.dtype)
         with torch.no_grad():
             if fp16:
                 with autocast():
-                    _, out, _ = model(ctx_ids_batch, ctx_seg_batch, ctx_attn_mask)
+                    # _, out, _ = model(ctx_ids_batch, ctx_seg_batch, ctx_attn_mask)
+                    out = model(ctx_ids_batch, ctx_seg_batch, ctx_attn_mask)[1]
+                    # print(out)
             else:
-                _, out, _ = model(ctx_ids_batch, ctx_seg_batch, ctx_attn_mask)
+                out= model(ctx_ids_batch, ctx_seg_batch, ctx_attn_mask)[1]
+                # out = model(ctx_ids_batch, ctx_seg_batch, ctx_attn_mask)
+
         out = out.float().cpu()
 
         batch_start = batch_id*bsz
@@ -120,21 +129,32 @@ def main(args):
     ctx_state = {key[prefix_len:]: value for (key, value) in saved_state.model_dict.items() if
                  key.startswith('ctx_model.')}
     model_to_load.load_state_dict(ctx_state)
-
-    logger.info('reading data from file=%s', args.ctx_file)
-
+    ctx_file = args.ctx_file.replace('"',"")
+    logger.info('reading data from file=%s', ctx_file)
+    file_list = glob.glob(ctx_file)
+    # print()
+    file_list = more_itertools.distribute(args.num_shards, file_list)[args.shard_id]
     rows = []
-    with open(args.ctx_file) as tsvfile:
-        reader = csv.reader(tsvfile, delimiter='\t')
-        # file format: doc_id, doc_text, title
-        rows.extend([(row[0], row[1], row[2]) for row in reader if row[0] != 'id'])
+    import json
+    # data = 
+    for file_path in file_list:
+        with open(file_path) as f:
+            for line in f:
+                datum = json.loads(line)
+                # for i,proof_el in enumerate(datum['positive_ctxs']): 
+                rows.append([datum['id'],datum['contents'],datum['meta']['title']])
 
-    shard_size = int(len(rows) / args.num_shards)
-    start_idx = args.shard_id * shard_size
-    end_idx = start_idx + shard_size
+    # with open(args.ctx_file) as tsvfile:
+    #     reader = csv.reader(tsvfile, delimiter='\t')
+    #     # file format: doc_id, doc_text, title
+    #     rows.extend([(row[0], row[1], row[2]) for row in reader if row[0] != 'id'])
 
-    logger.info('Producing encodings for passages range: %d to %d (out of total %d)', start_idx, end_idx, len(rows))
-    rows = rows[start_idx:end_idx]
+    # shard_size = int(len(rows) / args.num_shards)
+    # start_idx = args.shard_id * shard_size
+    # end_idx = start_idx + shard_size
+
+    # logger.info('Producing encodings for passages range: %d to %d (out of total %d)', start_idx, end_idx, len(rows))
+    # rows = rows[start_idx:end_idx]
 
     data = gen_ctx_vectors(rows, encoder, tensorizer, True, fp16=args.fp16)
 
@@ -159,7 +179,7 @@ if __name__ == '__main__':
                         help='output file path to write results to')
     parser.add_argument('--shard_id', type=int, default=0, help="Number(0-based) of data shard to process")
     parser.add_argument('--num_shards', type=int, default=1, help="Total amount of data shards")
-    parser.add_argument('--batch_size', type=int, default=32, help="Batch size for the passage encoder forward pass")
+    parser.add_argument('--batch_size', type=int, default=64, help="Batch size for the passage encoder forward pass")
     args = parser.parse_args()
 
     assert args.model_file, 'Please specify --model_file checkpoint to init model weights'

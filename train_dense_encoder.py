@@ -11,6 +11,8 @@
  Pipeline to train DPR Biencoder
 """
 
+
+
 import argparse
 import glob
 import logging
@@ -19,6 +21,7 @@ import os
 import random
 import time
 
+from comet_ml import Experiment
 import torch
 import torch.distributed as dist
 
@@ -33,21 +36,50 @@ from dpr.models import init_biencoder_components
 from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch
 from dpr.options import add_encoder_params, add_training_params, setup_args_gpu, set_seed, print_args, \
     get_encoder_params_state, add_tokenizer_params, set_encoder_params_from_state
-from dpr.utils.data_utils import ShardedDataIterator, read_data_from_json_files, Tensorizer, ShardedDataIterableDataset
+from dpr.utils.data_utils import ShardedDataIterator, read_data_from_json_files, Tensorizer, ShardedDataIterableDataset,ShardedDistinctDataIterableDataset
 from dpr.utils.dist_utils import all_gather_list
 from dpr.utils.model_utils import setup_for_distributed_mode, move_to_device, get_schedule_linear, CheckpointState, \
     get_model_file, get_model_obj, load_states_from_checkpoint
+import humanize
+import datetime as dt
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(message)s',
     level=logging.INFO,
     datefmt='%Y-%m-%d %H:%M:%S')
+
+# Import comet_ml at the top of your file
+
+# Create an experiment with your api key
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 if (logger.hasHandlers()):
     logger.handlers.clear()
 console = logging.StreamHandler()
 logger.addHandler(console)
+
+from timeit import default_timer
+
+
+class Timer(object):
+    def __init__(self,epochs, verbose=False):
+        self.verbose = verbose
+        self.epochs = epochs
+        self.timer = default_timer
+        
+    def __enter__(self):
+        self.start = self.timer()
+        return self
+        
+    def __exit__(self, *args):
+        end = self.timer()
+        self.elapsed_secs = end - self.start
+        self.elapsed = self.elapsed_secs * 1000  # millisecs
+        
+        delta = humanize.precisedelta(dt.timedelta(seconds=self.epochs*self.elapsed_secs))
+
+        logger.info(f'Estimated runtime: {delta}')
 
 
 class RandContext:
@@ -78,6 +110,15 @@ class BiEncoderTrainer(object):
     """
 
     def __init__(self, args):
+        self.experiment = Experiment(
+            api_key="PS8IY0HG0jsA5QHuVSehUAb6H",
+            project_name="odqa-agg",
+            workspace="ohadrubin",
+            
+        )
+        self.experiment.set_name(args.output_dir.split("/")[-1])
+        self.experiment.log_parameters(args)
+
         self.args = args
         self.shard_id = args.local_rank if args.local_rank != -1 else 0
         self.distributed_factor = args.distributed_world_size or 1
@@ -107,37 +148,51 @@ class BiEncoderTrainer(object):
         self.best_cp_name = None
         if saved_state:
             self._load_saved_state(saved_state)
-
+        # print("hi")
         self.scaler = torch.cuda.amp.GradScaler() if self.args.fp16 else None
 
-    def get_data_iterator(self, path: str, batch_size: int, shuffle=True,
+    def get_data_iterator(self, path: str, batch_size: int,format_type: str, shuffle=True,
                           shuffle_seed: int = 0,
-                          offset: int = 0, upsample_rates: list = None) -> ShardedDataIterator:
+                          offset: int = 0, upsample_rates: list = None ) -> ShardedDataIterator:
         data_files = glob.glob(path)
+        # data = read_data_from_json_files(data_files , format_type, upsample_rates)
         data = read_data_from_json_files(data_files, upsample_rates)
+        
+        
+        
+        # data = reformat_data(data)
 
         # filter those without positive ctx
         data = [r for r in data if len(r['positive_ctxs']) > 0]
+        data = [r for r in data if len(r['question']) > 0]
+        
         logger.info('Total cleaned data size: {}'.format(len(data)))
 
         return ShardedDataIterator(data, shard_id=self.shard_id,
                                    num_shards=self.distributed_factor,
                                    batch_size=batch_size, shuffle=shuffle, shuffle_seed=shuffle_seed, offset=offset,
-                                   strict_batch_size=True,  # this is not really necessary, one can probably disable it
+                                #    strict_batch_size=True,  # this is not really necessary, one can probably disable it
                                    )
 
-    def get_data_iterable(self, path: str, batch_size: int, shuffle=True,
+    def get_data_iterable(self, path: str, batch_size: int,format_type:str, shuffle=True,
                           shuffle_seed: int = 0,
                           offset: int = 0, upsample_rates: list = None,
                           process_fn: Callable = None) -> ShardedDataIterator:
         data_files = glob.glob(path)
         data = read_data_from_json_files(data_files, upsample_rates)
+        # print(len(data))
+        data = [r for r in data if len(r['positive_ctxs']) > 0]
+        data = [r for r in data if len(r['question']) > 0]
+        # data = reformat_data(data)
 
         # filter those without positive ctx
-        data = [r for r in data if len(r['positive_ctxs']) > 0]
+        # data = [r for r in data if len(r['positive_ctxs']) > 0]
         logger.info('Total cleaned data size: {}'.format(len(data)))
-
-        return ShardedDataIterableDataset(
+        if self.args.use_distinct:
+            obj = ShardedDistinctDataIterableDataset
+        else:
+            obj = ShardedDataIterableDataset 
+        return obj(
             data,
             process_fn=process_fn,
             shard_id=self.shard_id,
@@ -158,7 +213,7 @@ class BiEncoderTrainer(object):
             shuffle_positives=args.shuffle_positive_ctx
         )
         train_iterable = self.get_data_iterable(
-            args.train_file, args.batch_size,
+            args.train_file, args.batch_size,args.format_type,
             process_fn=process_fn,
             shuffle=True,
             shuffle_seed=args.seed, offset=self.start_batch,
@@ -177,11 +232,13 @@ class BiEncoderTrainer(object):
             scheduler.load_state_dict(self.scheduler_state)
 
         eval_step = math.ceil(updates_per_epoch / args.eval_per_epoch)
+        # eval_step =  900
         logger.info("  Eval step = %d", eval_step)
         logger.info("***** Training *****")
 
         for epoch in range(self.start_epoch, int(args.num_train_epochs)):
             logger.info("***** Epoch %d *****", epoch)
+            
             self._train_epoch(scheduler, epoch, eval_step, train_iterable)
 
         if args.local_rank in [-1, 0]:
@@ -194,26 +251,33 @@ class BiEncoderTrainer(object):
 
         if epoch == args.val_av_rank_start_epoch:
             self.best_validation_result = None
-
-        if epoch >= args.val_av_rank_start_epoch:
-            validation_loss = self.validate_average_rank()
-        else:
-            validation_loss = self.validate_nll()
-
-        if save_cp:
+        validation_loss = self.validate_average_rank()
+        # if epoch >= args.val_av_rank_start_epoch:
+            
+        # else:
+        #     validation_loss = self.validate_nll()
+        
+        if save_cp and validation_loss < (self.best_validation_result or validation_loss + 1):
             cp_name = self._save_checkpoint(scheduler, epoch, iteration)
             logger.info('Saved checkpoint to %s', cp_name)
 
-            if validation_loss < (self.best_validation_result or validation_loss + 1):
-                self.best_validation_result = validation_loss
-                self.best_cp_name = cp_name
-                logger.info('New Best validation checkpoint %s', cp_name)
+            # if :
+            self.best_validation_result = validation_loss
+            self.best_cp_name = cp_name
+            logger.info('New Best validation checkpoint %s', cp_name)
+        elif save_cp and (epoch%5)==0:
+            cp_name = self._save_checkpoint(scheduler, epoch, iteration)
+            logger.info('Saved checkpoint to %s', cp_name)
+        else:
+            pass
+            
+        
 
     def validate_nll(self) -> float:
         logger.info('NLL validation ...')
         args = self.args
         self.biencoder.eval()
-        data_iterator = self.get_data_iterator(args.dev_file, args.dev_batch_size, shuffle=False)
+        data_iterator = self.get_data_iterator(args.dev_file,args.dev_batch_size, args.format_type, shuffle=False)
 
         total_loss = 0.0
         start_time = time.time()
@@ -225,7 +289,9 @@ class BiEncoderTrainer(object):
         for i, samples_batch in enumerate(data_iterator.iterate_data()):
             biencoder_input = BiEncoder.create_biencoder_input(samples_batch, self.tensorizer,
                                                                True,
-                                                               num_hard_negatives, num_other_negatives, shuffle=False)
+                                                               num_hard_negatives, num_other_negatives,
+                                                               shuffle=False,shuffle_positives=self.shuffle_positives,
+                                                               unique_idx=args.unique_idx)
 
             loss, correct_cnt = _do_biencoder_fwd_pass(self.biencoder, biencoder_input, self.tensorizer, args)
             total_loss += loss.item()
@@ -233,10 +299,15 @@ class BiEncoderTrainer(object):
             batches += 1
             if (i + 1) % log_result_step == 0:
                 logger.info('Eval step: %d , used_time=%f sec., loss=%f ', i, time.time() - start_time, loss.item())
+                
+
 
         total_loss = total_loss / batches
         total_samples = batches * args.dev_batch_size * self.distributed_factor
         correct_ratio = float(total_correct_predictions / total_samples)
+        self.experiment.log_metric("validation/correct_ratio", correct_ratio)
+        self.experiment.log_metric("validation/total_loss", total_loss)
+
         logger.info('NLL Validation: loss = %f. correct prediction ratio  %d/%d ~  %f', total_loss,
                     total_correct_predictions,
                     total_samples,
@@ -260,7 +331,7 @@ class BiEncoderTrainer(object):
         self.biencoder.eval()
         distributed_factor = self.distributed_factor
 
-        data_iterator = self.get_data_iterator(args.dev_file, args.dev_batch_size, shuffle=False)
+        data_iterator = self.get_data_iterator(args.dev_file, args.dev_batch_size,args.format_type, shuffle=False)
 
         sub_batch_size = args.val_av_rank_bsz
         sim_score_f = BiEncoderNllLoss.get_similarity_function()
@@ -280,7 +351,8 @@ class BiEncoderTrainer(object):
 
             biencoder_input = BiEncoder.create_biencoder_input(samples_batch, self.tensorizer,
                                                                True,
-                                                               num_hard_negatives, num_other_negatives, shuffle=False)
+                                                               num_hard_negatives, num_other_negatives,
+                                                               shuffle=False,unique_idx=args.unique_idx)
             biencoder_input = BiEncoderBatch(**move_to_device(biencoder_input._asdict(), args.device))
             total_ctxs = len(ctx_represenations)
             ctxs_ids = biencoder_input.context_ids
@@ -322,7 +394,7 @@ class BiEncoderTrainer(object):
             batch_positive_idxs = biencoder_input.is_positive
             positive_idx_per_question.extend([total_ctxs + v for v in batch_positive_idxs])
 
-            if (i + 1) % log_result_step == 0:
+            if ((i + 1) % log_result_step) == 0:
                 logger.info('Av.rank validation: step %d, computed ctx_vectors %d, q_vectors %d', i,
                             len(ctx_represenations), len(q_represenations))
 
@@ -356,6 +428,8 @@ class BiEncoderTrainer(object):
 
         av_rank = float(rank / q_num)
         logger.info('Av.rank validation: average rank %s, total questions=%d', av_rank, q_num)
+        self.experiment.log_metric("validation/average_rank", av_rank)
+        # self.experiment.log_metric("validation/total_loss", total_loss)
         return av_rank
 
     def _train_epoch(self, scheduler, epoch: int, eval_step: int,
@@ -367,10 +441,12 @@ class BiEncoderTrainer(object):
         epoch_correct_predictions = 0
 
         log_result_step = args.log_batch_step
+        # rolling_loss_step = 1
         rolling_loss_step = args.train_rolling_loss_step
         num_hard_negatives = args.hard_negatives
         num_other_negatives = args.other_negatives
         seed = args.seed
+        self.experiment.set_epoch(epoch)
         self.biencoder.train()
         epoch_batches = train_data_iterator.max_iterations
         data_iteration = 0
@@ -379,62 +455,67 @@ class BiEncoderTrainer(object):
         start_iteration = train_data_iterator.get_iteration() + 1
 
         loader = DataLoader(train_data_iterator, num_workers=1, batch_size=None, shuffle=False)
-
         for i, biencoder_batch in enumerate(loader):
+            with Timer(epochs=epoch_batches*(int(args.num_train_epochs)-epoch)-i):
+                    # to be able to resume shuffled ctx- pools
+                data_iteration = i + start_iteration
 
-            # to be able to resume shuffled ctx- pools
-            data_iteration = i + start_iteration
-
-            if args.grad_cache:
-                loss, correct_cnt = _do_biencoder_fwd_bwd_pass_cached(
-                    self.biencoder, biencoder_batch, self.tensorizer, args, self)
-            else:
-                loss, correct_cnt = _do_biencoder_fwd_pass(self.biencoder, biencoder_batch, self.tensorizer, args)
-                _loss = loss * (self.distributed_factor / 8.)
-                if self.args.fp16:
-                    self.scaler.scale(_loss).backward()
+                if args.grad_cache:
+                    loss, correct_cnt = _do_biencoder_fwd_bwd_pass_cached(
+                        self.biencoder, biencoder_batch, self.tensorizer, args, self)
                 else:
-                    _loss.backward()
+                    loss, correct_cnt = _do_biencoder_fwd_pass(self.biencoder, biencoder_batch, self.tensorizer, args)
+                    _loss = loss * (self.distributed_factor / 8.)
+                    if self.args.fp16:
+                        self.scaler.scale(_loss).backward()
+                    else:
+                        _loss.backward()
 
-            epoch_correct_predictions += correct_cnt
-            epoch_loss += loss.item()
-            rolling_train_loss += loss.item()
+                epoch_correct_predictions += correct_cnt
+                epoch_loss += loss.item()
+                rolling_train_loss += loss.item()
 
-            if (i + 1) % args.gradient_accumulation_steps == 0:
-                if self.args.fp16:
-                    self.scaler.unscale_(self.optimizer)
-                if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self.biencoder.parameters(), args.max_grad_norm)
-                if self.args.fp16:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
+                if (i + 1) % args.gradient_accumulation_steps == 0:
+                    if self.args.fp16:
+                        self.scaler.unscale_(self.optimizer)
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.biencoder.parameters(), args.max_grad_norm)
+                    if self.args.fp16:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
 
-                scheduler.step()
-                self.biencoder.zero_grad()
+                    scheduler.step()
+                    self.biencoder.zero_grad()
 
-            if i % log_result_step == 0:
-                lr = self.optimizer.param_groups[0]['lr']
-                logger.info(
-                    'Epoch: %d: Step: %d/%d, loss=%f, lr=%f', epoch, data_iteration, epoch_batches, loss.item(), lr)
+                if (i % log_result_step) == 0:
+                    lr = self.optimizer.param_groups[0]['lr']
+                    logger.info(
+                        'Epoch: %d: Step: %d/%d, loss=%f, lr=%f', epoch, data_iteration, epoch_batches, loss.item(), lr)
+                self.experiment.log_metric("train/lr", lr)
+                self.experiment.log_metric("train/data_iteration", data_iteration)
+                self.experiment.log_metric("train/loss", loss.item())
 
-            if (i + 1) % rolling_loss_step == 0:
-                logger.info('Train batch %d', data_iteration)
-                latest_rolling_train_av_loss = rolling_train_loss / rolling_loss_step
-                logger.info('Avg. loss per last %d batches: %f', rolling_loss_step, latest_rolling_train_av_loss)
-                rolling_train_loss = 0.0
+                if ((i + 1) % rolling_loss_step) == 0:
+                    logger.info('Train batch %d', data_iteration)
+                    latest_rolling_train_av_loss = rolling_train_loss / rolling_loss_step
+                    logger.info('Avg. loss per last %d batches: %f', rolling_loss_step, latest_rolling_train_av_loss)
+                    rolling_train_loss = 0.0
 
-            if data_iteration % eval_step == 0:
-                logger.info('Validation: Epoch: %d Step: %d/%d', epoch, data_iteration, epoch_batches)
-                self.validate_and_save(epoch, i + start_iteration, scheduler)
-                self.biencoder.train()
+            # if data_iteration % eval_step == 0:
+            #     logger.info('Validation: Epoch: %d Step: %d/%d', epoch, data_iteration, epoch_batches)
+            #     self.validate_and_save(epoch, i + start_iteration, scheduler)
+            #     self.biencoder.train()
 
+        
+        
+        
         self.validate_and_save(epoch, data_iteration, scheduler)
-
         epoch_loss = (epoch_loss / epoch_batches) if epoch_batches > 0 else 0
         logger.info('Av Loss per epoch=%f', epoch_loss)
         logger.info('epoch total correct predictions=%d', epoch_correct_predictions)
+        self.experiment.log_metric("train/epoch_correct_predictions", epoch_correct_predictions)
 
     def _save_checkpoint(self, scheduler, epoch: int, offset: int) -> str:
         args = self.args
@@ -531,8 +612,7 @@ def _calc_loss(args, loss_function, local_q_vector, local_ctx_vectors, local_pos
     return loss, is_correct
 
 
-def _do_biencoder_fwd_pass(model: nn.Module, input: BiEncoderBatch, tensorizer: Tensorizer, args) -> (
-        torch.Tensor, int):
+def _do_biencoder_fwd_pass(model: nn.Module, input: BiEncoderBatch, tensorizer: Tensorizer, args):
     input = BiEncoderBatch(**move_to_device(input._asdict(), args.device))
 
     q_attn_mask = tensorizer.get_attn_mask(input.question_ids)
@@ -579,7 +659,7 @@ def _do_biencoder_fwd_bwd_pass_cached(
         tensorizer: Tensorizer,
         args,
         trainer: BiEncoderTrainer,
-) -> (torch.Tensor, int):
+):
     input = BiEncoderBatch(**move_to_device(input._asdict(), args.device))
 
     q_attn_mask = tensorizer.get_attn_mask(input.question_ids)
@@ -739,11 +819,13 @@ def main():
 
     parser.add_argument("--fix_ctx_encoder", action='store_true')
     parser.add_argument("--shuffle_positive_ctx", action='store_true')
+    parser.add_argument("--use_distinct", action='store_true')
+    parser.add_argument("--unique_idx", action='store_true')
 
     # input/output src params
     parser.add_argument("--output_dir", default=None, type=str,
                         help="The output directory where the model checkpoints will be written or resumed from")
-
+    parser.add_argument("--format_type", type=str)
     # data handling parameters
     parser.add_argument("--hard_negatives", default=1, type=int,
                         help="amount of hard negative ctx per question")
@@ -764,8 +846,15 @@ def main():
     parser.add_argument("--val_av_rank_max_qs", type=int, default=10000,
                         help="Av.rank validation: max num of questions")
     parser.add_argument('--checkpoint_file_name', type=str, default='dpr_biencoder', help="Checkpoints file prefix")
+    parser.add_argument("--debug", action='store_true')
+
+    
 
     args = parser.parse_args()
+    if args.debug:
+        import debugpy
+        debugpy.listen(5679)
+        # debugpy.wait_for_client()
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -784,7 +873,7 @@ def main():
         trainer.run_train()
     elif args.model_file and args.dev_file:
         logger.info("No train files are specified. Run 2 types of validation for specified model file")
-        trainer.validate_nll()
+        # trainer.validate_nll()
         trainer.validate_average_rank()
     else:
         logger.warning("Neither train_file or (model_file & dev_file) parameters are specified. Nothing to do.")

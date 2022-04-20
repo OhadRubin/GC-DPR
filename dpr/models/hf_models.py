@@ -15,11 +15,12 @@ from typing import Tuple
 import torch
 from torch import Tensor as T
 from torch import nn
-from transformers.modeling_bert import BertConfig, BertModel
+from transformers.models.bert.modeling_bert import BertConfig, BertModel
 from transformers.optimization import AdamW
-from transformers.tokenization_bert import BertTokenizer
-from transformers.tokenization_roberta import RobertaTokenizer
-
+from transformers import AutoConfig
+from transformers.models.bert.tokenization_bert import BertTokenizer
+from transformers.models.roberta.tokenization_roberta import RobertaTokenizer
+from transformers import AutoModel,AutoTokenizer
 from dpr.utils.data_utils import Tensorizer
 from .biencoder import BiEncoder
 from .reader import Reader
@@ -29,12 +30,21 @@ logger = logging.getLogger(__name__)
 
 def get_bert_biencoder_components(args, inference_only: bool = False, **kwargs):
     dropout = args.dropout if hasattr(args, 'dropout') else 0.0
-    question_encoder = HFBertEncoder.init_encoder(args.pretrained_model_cfg,
-                                                  projection_dim=args.projection_dim, dropout=dropout, **kwargs)
-    ctx_encoder = HFBertEncoder.init_encoder(args.pretrained_model_cfg,
-                                             projection_dim=args.projection_dim, dropout=dropout, **kwargs)
+    # question_encoder = HFBertEncoder.init_encoder(args.pretrained_model_cfg,
+    #                                               projection_dim=args.projection_dim, dropout=dropout, **kwargs)
+    # ctx_encoder = HFBertEncoder.init_encoder(args.pretrained_model_cfg,
+    #                                          projection_dim=args.projection_dim, dropout=dropout, **kwargs)
+    config = AutoConfig.from_pretrained(pretrained_model_name_or_path=args.pretrained_model_cfg,
+                    attention_probs_dropout_prob = dropout,
+                    hidden_dropout_prob = dropout,
+                    )
+    question_encoder = AutoModel.from_config(config)
+    ctx_encoder = AutoModel.from_config(config)
 
+    # args.pretrained_model_cfg
     fix_ctx_encoder = args.fix_ctx_encoder if hasattr(args, 'fix_ctx_encoder') else False
+
+
     biencoder = BiEncoder(question_encoder, ctx_encoder, fix_ctx_encoder=fix_ctx_encoder)
 
     optimizer = get_optimizer(biencoder,
@@ -90,7 +100,7 @@ def get_optimizer(model: nn.Module, learning_rate: float = 1e-5, adam_eps: float
 
 
 def get_bert_tokenizer(pretrained_cfg_name: str, do_lower_case: bool = True):
-    return BertTokenizer.from_pretrained(pretrained_cfg_name, do_lower_case=do_lower_case)
+    return AutoTokenizer.from_pretrained(pretrained_cfg_name, do_lower_case=do_lower_case)
 
 
 def get_roberta_tokenizer(pretrained_cfg_name: str, do_lower_case: bool = True):
@@ -142,16 +152,24 @@ class BertTensorizer(Tensorizer):
         self.pad_to_max = pad_to_max
 
     def text_to_tensor(self, text: str, title: str = None, add_special_tokens: bool = True):
-        text = text.strip()
+        if isinstance(text, str):
+            text = text.strip()
+        elif isinstance(text, list):
+            # assert len(text)==1,text
+            text = " ".join(text).strip() #TODO: possible bug
+        else:
+            assert False, "I don't know what to do"
+
 
         # tokenizer automatic padding is explicitly disabled since its inconsistent behavior
         if title:
-            token_ids = self.tokenizer.encode(title, text_pair=text, add_special_tokens=add_special_tokens,
+            text = f"{title} \t\t {text}".replace("  "," ") #TODO: possible bug
+            token_ids = self.tokenizer.encode(text, add_special_tokens=add_special_tokens,
                                               max_length=self.max_length,
-                                              pad_to_max_length=False, truncation=True)
+                                              pad_to_max_length=False, truncation="longest_first")
         else:
             token_ids = self.tokenizer.encode(text, add_special_tokens=add_special_tokens, max_length=self.max_length,
-                                              pad_to_max_length=False, truncation=True)
+                                              pad_to_max_length=False, truncation="longest_first")
 
         seq_len = self.max_length
         if self.pad_to_max and len(token_ids) < seq_len:

@@ -42,7 +42,6 @@ logger.addHandler(console)
 
 ReaderQuestionPredictions = collections.namedtuple('ReaderQuestionPredictions', ['id', 'predictions', 'gold_answers'])
 
-
 class ReaderTrainer(object):
     def __init__(self, args):
         self.args = args
@@ -51,7 +50,6 @@ class ReaderTrainer(object):
         self.distributed_factor = args.distributed_world_size or 1
 
         logger.info("***** Initializing components for training *****")
-
         model_file = get_model_file(self.args, self.args.checkpoint_file_name)
         saved_state = None
         if model_file:
